@@ -1,0 +1,12 @@
+# M1 desktop = off-the-shelf pieces, so we have a measured baseline BEFORE writing our own shell (M2).
+labwc
+xwayland
+foot
+swaybg
+waybar
+fuzzel
+fonts-inter
+fonts-dejavu-core
+adwaita-icon-theme
+libgl1-mesa-dri
+libegl-mesa0

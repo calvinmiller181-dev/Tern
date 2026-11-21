@@ -1,0 +1,13 @@
+[Unit]
+Description=Tern idle-footprint measurement (runs only with tern.measure=1 on the kernel command line)
+After=graphical.target getty@tty1.service
+ConditionKernelCommandLine=tern.measure=1
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+ExecStart=/usr/local/bin/tern-measure-idle --from-cmdline --samples 5 --json --label qemu --tty /dev/ttyS0
+ExecStartPost=/usr/bin/systemctl --no-block poweroff
+
+[Install]
+WantedBy=multi-user.target

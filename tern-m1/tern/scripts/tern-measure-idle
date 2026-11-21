@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# tern-measure-idle - a repeatable idle-footprint snapshot for Tern.
+#
+# Definition used everywhere in this project:
+#   idle footprint = MemTotal - MemAvailable   (from /proc/meminfo)
+# taken after the system has sat idle for --wait seconds with no apps open.
+# Everything else this script prints is there to explain that one number.
+#
+# Run as root (sudo) so per-process PSS can be read for every process.
+set -u
+export LC_ALL=C
+
+SCHEMA=1
+WAIT=0; SAMPLES=5; TOPN=12; JSON_ONLY=0; LABEL=""; OUT=""; TTY=""; FROM_CMDLINE=0
+
+usage() {
+	cat <<'USAGE'
+Usage: tern-measure-idle [options]
+
+  --wait SECONDS     sleep first so the system can settle (default 0; use 300 for a real baseline)
+  --now              same as --wait 0
+  --samples N        MemAvailable samples, 1 s apart (default 5; the median is reported)
+  --label TEXT       free-text tag stored with the result (e.g. "tuned", "no-tuning")
+  --top N            number of processes to list by PSS (default 12)
+  --json             print only the JSON line on stdout
+  --out FILE         also append the JSON line to FILE (one run per line)
+  --tty DEVICE       also write "TERN_MEASURE_JSON <line>" to DEVICE (used by the QEMU test)
+  --from-cmdline     read the wait time from tern.measure_wait=N on the kernel command line
+  -h, --help         show this help
+USAGE
+}
+
+die() { echo "tern-measure-idle: $*" >&2; exit 2; }
+is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--wait)         [ $# -ge 2 ] || die "--wait needs a value"; WAIT="$2"; shift 2 ;;
+		--now)          WAIT=0; shift ;;
+		--samples)      [ $# -ge 2 ] || die "--samples needs a value"; SAMPLES="$2"; shift 2 ;;
+		--label)        [ $# -ge 2 ] || die "--label needs a value"; LABEL="$2"; shift 2 ;;
+		--top)          [ $# -ge 2 ] || die "--top needs a value"; TOPN="$2"; shift 2 ;;
+		--json)         JSON_ONLY=1; shift ;;
+		--out)          [ $# -ge 2 ] || die "--out needs a value"; OUT="$2"; shift 2 ;;
+		--tty)          [ $# -ge 2 ] || die "--tty needs a value"; TTY="$2"; shift 2 ;;
+		--from-cmdline) FROM_CMDLINE=1; shift ;;
+		-h|--help)      usage; exit 0 ;;
+		*)              usage >&2; die "unknown option: $1" ;;
+	esac
+done
+
+if [ "$FROM_CMDLINE" -eq 1 ]; then
+	WAIT=$(sed -n 's/.*tern\.measure_wait=\([0-9][0-9]*\).*/\1/p' /proc/cmdline)
+	WAIT=${WAIT:-300}
+fi
+is_uint "$WAIT"    || die "--wait must be a whole number of seconds"
+is_uint "$SAMPLES" || die "--samples must be a whole number"
+is_uint "$TOPN"    || die "--top must be a whole number"
+[ "$SAMPLES" -ge 1 ] || die "--samples must be at least 1"
+
+say() { [ "$JSON_ONLY" -eq 1 ] || printf '%s\n' "$*" >&2; }
+
+if [ "$(id -u)" -ne 0 ]; then
+	say "note: not running as root; per-process PSS only covers your own processes."
+	IS_ROOT=false
+else
+	IS_ROOT=true
+fi
+
+if [ "$WAIT" -gt 0 ]; then
+	say "Waiting ${WAIT}s for the system to settle..."
+	sleep "$WAIT"
+fi
+
+# ---------- helpers ----------
+mi()  { awk -v k="$1:" '$1 == k { print $2; f = 1; exit } END { if (!f) print 0 }' /proc/meminfo; }
+mib() { awk -v v="$1" 'BEGIN { printf "%.1f", v / 1024 }'; }
+bytes_mib() { awk -v v="$1" 'BEGIN { printf "%.1f", v / 1048576 }'; }
+used_kb() { awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } END { print t - a }' /proc/meminfo; }
+jstr() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'; }
+
+psi_avg300() {
+	[ -r /proc/pressure/memory ] || { echo null; return; }
+	awk '$1 == "some" { for (i = 2; i <= NF; i++) if ($i ~ /^avg300=/) { sub(/^avg300=/, "", $i); print $i; exit } }' /proc/pressure/memory
+}
+
+display_info() {
+	local out="" s dir mode
+	for s in /sys/class/drm/card*-*/status; do
+		[ -r "$s" ] || continue
+		[ "$(cat "$s" 2>/dev/null)" = "connected" ] || continue
+		dir=$(dirname "$s")
+		mode=$(head -n 1 "$dir/modes" 2>/dev/null)
+		out="${out:+$out,}${mode:-unknown}"
+	done
+	echo "${out:-none}"
+}
+
+pss_table() {
+	local d comm pss
+	for d in /proc/[0-9]*; do
+		pss=$(awk '/^Pss:/ { print $2; exit }' "$d/smaps_rollup" 2>/dev/null) || continue
+		[ -n "$pss" ] || continue
+		comm=$(cat "$d/comm" 2>/dev/null) || continue
+		printf '%s\t%s\n' "$pss" "$comm"
+	done
+}
+
+# ---------- sample ----------
+samples=()
+for ((i = 0; i < SAMPLES; i++)); do
+	samples+=("$(used_kb)")
+	if [ "$i" -lt $((SAMPLES - 1)) ]; then sleep 1; fi
+done
+mapfile -t sorted < <(printf '%s\n' "${samples[@]}" | sort -n)
+used_min=${sorted[0]}
+used_max=${sorted[$((SAMPLES - 1))]}
+used_med=${sorted[$((SAMPLES / 2))]}
+
+total=$(mi MemTotal); buffers=$(mi Buffers); cached=$(mi Cached); shmem=$(mi Shmem)
+slab=$(mi Slab); sunreclaim=$(mi SUnreclaim); kstack=$(mi KernelStack)
+ptables=$(mi PageTables); percpu=$(mi Percpu)
+swaptotal=$(mi SwapTotal); swapfree=$(mi SwapFree)
+swapused=$((swaptotal - swapfree))
+
+zram_orig=0; zram_comp=0; zram_used=0
+if [ -r /sys/block/zram0/mm_stat ]; then
+	read -r zram_orig zram_comp zram_used _ < /sys/block/zram0/mm_stat || true
+fi
+
+tmp=$(mktemp); trap 'rm -f "$tmp" "$tmp.agg"' EXIT
+pss_table > "$tmp"
+pss_total_kb=$(awk -F'\t' '{ t += $1 } END { print t + 0 }' "$tmp")
+proc_count=$(wc -l < "$tmp" | tr -d ' ')
+awk -F'\t' '{ a[$2] += $1; n[$2]++ } END { for (k in a) printf "%d\t%d\t%s\n", a[k], n[k], k }' "$tmp" \
+	| sort -t "$(printf '\t')" -k1,1nr | head -n "$TOPN" > "$tmp.agg"
+
+top_json=$(awk -F'\t' 'BEGIN { printf "[" }
+	{ gsub(/[\\"]/, "", $3); printf "%s{\"name\":\"%s\",\"pss_mib\":%.1f,\"count\":%d}", (NR > 1 ? "," : ""), $3, $1 / 1024, $2 }
+	END { printf "]" }' "$tmp.agg")
+
+# ---------- context ----------
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+kernel=$(uname -r)
+cpu_model=$(awk -F: '/model name/ { sub(/^ +/, "", $2); print $2; exit }' /proc/cpuinfo 2>/dev/null)
+cpu_model=${cpu_model:-unknown}
+cpus=$(nproc 2>/dev/null || echo 1)
+display=$(display_info)
+release=$( ( . /etc/tern-release 2>/dev/null && echo "${TERN_BUILD:-unknown}" ) || echo unknown )
+tuning=$( ( . /etc/tern-release 2>/dev/null && echo "${TERN_TUNING:-unknown}" ) || echo unknown )
+boot=$(systemd-analyze 2>/dev/null | head -n 1)
+boot=${boot:-n/a}
+psi=$(psi_avg300); psi=${psi:-null}
+
+used_med_mib=$(mib "$used_med")
+pss_mib=$(mib "$pss_total_kb")
+residual_mib=$(awk -v u="$used_med" -v p="$pss_total_kb" 'BEGIN { r = u - p; if (r < 0) r = 0; printf "%.1f", r / 1024 }')
+
+json=$(printf '{"schema":%s,"label":"%s","timestamp":"%s","release":"%s","tuning":"%s","kernel":"%s","cpu_model":"%s","cpus":%s,"display":"%s","mem_total_mib":%s,"idle_used_mib":%s,"idle_used_min_mib":%s,"idle_used_max_mib":%s,"samples":%s,"waited_s":%s,"userspace_pss_mib":%s,"residual_mib":%s,"slab_mib":%s,"slab_unreclaimable_mib":%s,"page_cache_mib":%s,"shmem_mib":%s,"swap_used_mib":%s,"zram_orig_mib":%s,"zram_compressed_mib":%s,"zram_mem_used_mib":%s,"psi_mem_some_avg300":%s,"boot":"%s","root":%s,"processes_read":%s,"top":%s}' \
+	"$SCHEMA" "$(jstr "$LABEL")" "$ts" "$(jstr "$release")" "$(jstr "$tuning")" "$(jstr "$kernel")" "$(jstr "$cpu_model")" "$cpus" "$(jstr "$display")" \
+	"$(mib "$total")" "$used_med_mib" "$(mib "$used_min")" "$(mib "$used_max")" "$SAMPLES" "$WAIT" \
+	"$pss_mib" "$residual_mib" "$(mib "$slab")" "$(mib "$sunreclaim")" "$(mib $((buffers + cached)))" "$(mib "$shmem")" \
+	"$(mib "$swapused")" "$(bytes_mib "$zram_orig")" "$(bytes_mib "$zram_comp")" "$(bytes_mib "$zram_used")" \
+	"$psi" "$(jstr "$boot")" "$IS_ROOT" "$proc_count" "$top_json")
+
+# ---------- output ----------
+if [ -n "$OUT" ]; then printf '%s\n' "$json" >> "$OUT" || echo "tern-measure-idle: could not write $OUT" >&2; fi
+if [ -n "$TTY" ]; then printf 'TERN_MEASURE_JSON %s\n' "$json" > "$TTY" 2>/dev/null || echo "tern-measure-idle: could not write $TTY" >&2; fi
+
+if [ "$JSON_ONLY" -eq 1 ]; then
+	printf '%s\n' "$json"
+	exit 0
+fi
+
+printf 'Tern idle footprint   label: %s   %s\n' "${LABEL:--}" "$ts"
+printf 'Machine : %s x%s, %s MiB RAM, display %s, kernel %s\n' "$cpu_model" "$cpus" "$(mib "$total")" "$display" "$kernel"
+printf 'Build   : %s (tuning: %s)\n\n' "$release" "$tuning"
+printf 'Idle footprint (MemTotal - MemAvailable): %s MiB   [min %s / max %s over %s samples]\n' \
+	"$used_med_mib" "$(mib "$used_min")" "$(mib "$used_max")" "$SAMPLES"
+printf '  userspace PSS (sum, %s processes read) : %s MiB\n' "$proc_count" "$pss_mib"
+printf '  residual, approx. (kernel, tmpfs, driver buffers, rounding): %s MiB\n' "$residual_mib"
+printf '  slab %s MiB (unreclaimable %s) | page cache %s MiB | shmem %s MiB\n' \
+	"$(mib "$slab")" "$(mib "$sunreclaim")" "$(mib $((buffers + cached)))" "$(mib "$shmem")"
+printf '  swap used %s MiB | zram: %s MiB data -> %s MiB RAM | memory pressure (some, avg300): %s\n' \
+	"$(mib "$swapused")" "$(bytes_mib "$zram_orig")" "$(bytes_mib "$zram_used")" "$psi"
+printf '  boot: %s\n\n' "$boot"
+printf 'Top processes by PSS (grouped by name):\n'
+awk -F'\t' '{ printf "  %8.1f MiB  x%-3d %s\n", $1 / 1024, $2, $3 }' "$tmp.agg"
+printf '\nNotes: PSS splits shared pages between processes, so it is the fair per-process number.\n'
+printf 'On the live ISO the writable overlay lives in RAM, so compare live-to-live, not live-to-installed.\n'

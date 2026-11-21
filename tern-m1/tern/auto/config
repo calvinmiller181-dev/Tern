@@ -1,0 +1,22 @@
+#!/bin/sh
+# live-build "auto" wrapper: `lb config` re-runs this, so every build flag lives in one place.
+set -e
+
+lb config noauto \
+	--mode debian \
+	--distribution trixie \
+	--architectures amd64 \
+	--archive-areas "main non-free-firmware" \
+	--binary-images iso-hybrid \
+	--debian-installer none \
+	--apt-recommends false \
+	--apt-indices false \
+	--security true \
+	--updates true \
+	--cache true \
+	--image-name tern \
+	--iso-application "Tern" \
+	--iso-publisher "Tern project (unofficial, not affiliated with Debian)" \
+	--iso-volume "TERN_M1" \
+	--bootappend-live "boot=live components quiet username=tern hostname=tern" \
+	"${@}"

@@ -1,0 +1,34 @@
+# Recommends are OFF (see auto/config), so anything we rely on is listed explicitly.
+sudo
+dbus-user-session
+libpam-systemd
+ca-certificates
+locales
+xkb-data
+
+# Networking: NetworkManager headless (use nmtui / nmcli in M1). Candidate for replacement in M3 if measurements say so.
+network-manager
+wpasupplicant
+wireless-regdb
+
+# Hardware firmware (disk space only; firmware is loaded only if a device needs it)
+firmware-linux
+
+# Memory: compressed swap in RAM (configured in tuning/)
+systemd-zram-generator
+
+# Audio: explicit list instead of the pipewire-audio metapackage, to avoid pulling Bluetooth by accident
+pipewire
+pipewire-pulse
+pipewire-alsa
+wireplumber
+
+# Small CLI toolbox
+procps
+iproute2
+iputils-ping
+curl
+less
+nano
+htop
+jq

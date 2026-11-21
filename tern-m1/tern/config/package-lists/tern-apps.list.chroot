@@ -1,0 +1,3 @@
+# A real-world workload for manual testing (open a few tabs and re-run tern-measure-idle).
+# Delete this file for a smaller ISO; it does not affect the idle baseline.
+firefox-esr
