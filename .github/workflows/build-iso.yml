@@ -1,0 +1,48 @@
+name: Build Tern ISO
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container:
+      image: debian:trixie
+      options: --privileged
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            live-build debootstrap debian-archive-keyring xorriso squashfs-tools \
+            mtools dosfstools syslinux syslinux-common isolinux \
+            grub-pc-bin grub-efi-amd64-bin git ca-certificates
+
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Build the ISO
+        run: bash build.sh
+
+      - name: Upload the ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: tern-iso
+          path: |
+            *.iso
+            *.iso.sha256
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload the build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
